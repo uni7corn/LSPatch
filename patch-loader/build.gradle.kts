@@ -62,10 +62,13 @@ androidComponents.onVariants { variant ->
 }
 
 dependencies {
-    compileOnly(projects.hiddenapi.stubs)
-    implementation(projects.core)
-    implementation(projects.hiddenapi.bridge)
-    implementation(projects.services.daemonService)
+    compileOnly("vector:stubs")
+    // :legacy exposes de.robv.* and org.matrix.vector.Startup, and api-exports :xposed
+    // (org.matrix.vector.impl.*, io.github.libxposed.api.*).
+    implementation("vector:legacy")
+    implementation("vector:xposed")
+    implementation("vector:bridge")
+    implementation("vector:daemon-service")
     implementation(projects.share.android)
     implementation(projects.share.java)
 

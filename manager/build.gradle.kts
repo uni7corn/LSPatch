@@ -8,17 +8,34 @@ val coreVerCode: Int by rootProject.extra
 val coreVerName: String by rootProject.extra
 
 plugins {
+    // Kotlin comes from AGP 9's built-in support; applying org.jetbrains.kotlin.android is an error
+    // since AGP 9.0. The compose / ksp / parcelize plugins still attach to that built-in Kotlin.
     alias(libs.plugins.agp.app)
     alias(lspatch.plugins.compose.compiler)
     alias(lspatch.plugins.google.devtools.ksp)
     alias(lspatch.plugins.rikka.tools.refine)
-    alias(lspatch.plugins.kotlin.android)
-    id("kotlin-parcelize")
+    alias(lspatch.plugins.kotlin.serialization)
+    id("org.jetbrains.kotlin.plugin.parcelize")
 }
 
 android {
     defaultConfig {
         applicationId = defaultManagerPackageName
+
+        // The languages the picker offers, listed from the resource folders that carry our own
+        // strings.xml -- so one appears the moment a translator's folder lands, and none is offered
+        // for a language nothing is translated into. Deliberately not AssetManager.getLocales(),
+        // which reports every locale any dependency ships a resource for, pseudo-locales included.
+        val translations =
+            (listOf("en") +
+                    file("src/main/res")
+                        .listFiles()
+                        .orEmpty()
+                        .filter { it.isDirectory && it.name.startsWith("values-") }
+                        .filter { File(it, "strings.xml").exists() }
+                        .map { it.name.removePrefix("values-").replace("-r", "-") })
+                .sorted()
+        buildConfigField("String", "TRANSLATIONS", "\"${translations.joinToString(",")}\"")
     }
 
     androidResources {
@@ -39,23 +56,12 @@ android {
     }
 
     buildFeatures {
+        aidl = true
         compose = true
         buildConfig = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.13"
-    }
-
     namespace = "org.lsposed.lspatch"
-
-    applicationVariants.all {
-        kotlin.sourceSets {
-            getByName(name) {
-                kotlin.srcDir("build/generated/ksp/$name/kotlin")
-            }
-        }
-    }
 }
 
 afterEvaluate {
@@ -63,16 +69,25 @@ afterEvaluate {
         val variantLowered = variant.name.lowercase()
         val variantCapped = variant.name.replaceFirstChar { it.uppercase() }
 
-        task<Copy>("copy${variantCapped}Assets") {
-            dependsOn(":meta-loader:copy$variantCapped")
-            dependsOn(":patch-loader:copy$variantCapped")
-            tasks["merge${variantCapped}Assets"].dependsOn(this)
+        // The loader dex/so land in out/assets/<variant> (the assets srcDir above) from tasks in the
+        // sibling loader modules. Gradle cannot infer those producers from a shared directory, so the
+        // asset merge names them directly: a dependency routed through an aggregator lifecycle task
+        // carries no output and does not satisfy the input/output validation, which a parallel build
+        // (CI) turns into a hard error rather than a warning.
+        val loaderArtifacts = listOf(
+            ":meta-loader:copyDex$variantCapped",
+            ":patch-loader:copyDex$variantCapped",
+            ":patch-loader:copySo$variantCapped",
+        )
+        tasks.named("merge${variantCapped}Assets") { dependsOn(loaderArtifacts) }
 
-            into("$buildDir/intermediates/assets/$variantLowered/merge${variantCapped}Assets")
-            from("${rootProject.projectDir}/out/assets/${variant.name}")
-        }
+        // Lint reads that same directory to model the variant, and infers its producers no better than
+        // the asset merge does. Undeclared, the validation is a hard error rather than a warning, so
+        // `gradlew build` fails on a project that assembles perfectly well.
+        tasks.matching { it.name.contains("lint", ignoreCase = true) && it.name.contains(variantCapped) }
+            .configureEach { dependsOn(loaderArtifacts) }
 
-        task<Copy>("build$variantCapped") {
+        tasks.register<Copy>("build$variantCapped") {
             dependsOn(tasks["assemble$variantCapped"])
             from(variant.outputs.map { it.outputFile })
             into("${rootProject.projectDir}/out/$variantLowered")
@@ -83,7 +98,10 @@ afterEvaluate {
 
 dependencies {
     implementation(projects.patch)
-    implementation(projects.services.daemonService)
+    implementation(projects.apkzlib)
+    implementation("vector:axml")
+    implementation("vector:daemon-service")
+    implementation("vector:manager-ui")
     implementation(projects.share.android)
     implementation(projects.share.java)
     implementation(platform(lspatch.androidx.compose.bom))
@@ -96,25 +114,26 @@ dependencies {
     implementation(lspatch.androidx.activity.compose)
     implementation(lspatch.androidx.compose.material.icons.extended)
     implementation(lspatch.androidx.compose.material3)
+    implementation(lspatch.androidx.compose.material3.adaptive.navigation.suite)
     implementation(lspatch.androidx.compose.ui)
     implementation(lspatch.androidx.compose.ui.tooling.preview)
     implementation(lspatch.androidx.core.ktx)
     implementation(lspatch.androidx.lifecycle.viewmodel.compose)
-    implementation(lspatch.androidx.navigation.compose)
-    implementation(libs.androidx.preference)
+    implementation(lspatch.androidx.navigation3.runtime)
+    implementation(lspatch.androidx.navigation3.ui)
+    implementation(lspatch.androidx.lifecycle.viewmodel.navigation3)
+    implementation(lspatch.androidx.preference)
     implementation(lspatch.androidx.room.ktx)
     implementation(lspatch.androidx.room.runtime)
-    implementation(lspatch.google.accompanist.navigation.animation)
     implementation(lspatch.google.accompanist.pager)
     implementation(lspatch.google.accompanist.swiperefresh)
-    implementation(libs.material)
+    implementation(lspatch.material)
     implementation(libs.gson)
+    implementation(libs.okhttp)
+    implementation(libs.okhttp.dnsoverhttps)
     implementation(lspatch.rikka.shizuku.api)
     implementation(lspatch.rikka.shizuku.provider)
     implementation(lspatch.rikka.refine)
-    implementation(lspatch.raamcosta.compose.destinations)
-    implementation(libs.appiconloader)
-    implementation(libs.hiddenapibypass)
+    implementation(lspatch.hiddenapibypass)
     ksp(lspatch.androidx.room.compiler)
-    ksp(lspatch.raamcosta.compose.destinations.ksp)
 }

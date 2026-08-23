@@ -11,6 +11,7 @@ plugins {
     alias(libs.plugins.agp.app) apply false
     alias(lspatch.plugins.compose.compiler) apply false
     alias(lspatch.plugins.kotlin.android) apply false
+    alias(lspatch.plugins.diffplug.spotless) apply false
 }
 
 buildscript {
@@ -23,39 +24,51 @@ buildscript {
     }
 }
 
+// Count from the current HEAD, not a fixed remote branch: every commit -- on any branch, before it is
+// pushed -- bumps the version code, so a build made after a new commit is never mistaken for the one
+// before it (counting origin/master left branch builds sharing the master version code).
 val commitCount = run {
     val repo = FileRepository(rootProject.file(".git"))
-    val refId = repo.refDatabase.exactRef("refs/remotes/origin/master").objectId!!
-    Git(repo).log().add(refId).call().count()
+    val head = repo.resolve("HEAD")!!
+    Git(repo).log().add(head).call().count()
 }
 
-val (coreCommitCount, coreLatestTag) = FileRepositoryBuilder().setGitDir(rootProject.file(".git/modules/core"))
+val (coreCommitCount, coreLatestTag, coreCommitHash) = FileRepositoryBuilder()
+    // Resolve the core's real git dir from its worktree rather than assuming `.git/modules/core`:
+    // when the submodule is checked out as a full clone (its own `core/.git` directory), the modules
+    // copy is stale — wrong HEAD, no tags — and would drop us to the "1.0" fallback. findGitDir
+    // follows a gitdir-file too, so a fresh submodule clone still resolves correctly.
+    .setWorkTree(rootProject.file("core"))
+    .findGitDir()
     .runCatching {
         build().use { repo ->
             val git = Git(repo)
+            val head = repo.refDatabase.exactRef("HEAD").objectId
             val coreCommitCount =
                 git.log()
-                    .add(repo.refDatabase.exactRef("HEAD").objectId)
+                    .add(head)
                     .call().count() + 4200
             val ver = git.describe()
                 .setTags(true)
                 .setAbbrev(0).call().removePrefix("v")
-            coreCommitCount to ver
+            // The exact Vector commit the core was built from, so the manager can link to it.
+            Triple(coreCommitCount, ver, head.name)
         }
-    }.getOrNull() ?: (1 to "1.0")
+    }.getOrNull() ?: Triple(1, "1.0", "")
 
 // sync from https://github.com/JingMatrix/LSPosed/blob/master/build.gradle.kts
 val defaultManagerPackageName by extra("org.lsposed.lspatch")
-val apiCode by extra(93)
+val apiCode by extra(102)
 val verCode by extra(commitCount)
-val verName by extra("0.7")
+val verName by extra("1.2")
 val coreVerCode by extra(coreCommitCount)
 val coreVerName by extra(coreLatestTag)
+val coreVerHash by extra(coreCommitHash)
 val androidMinSdkVersion by extra(28)
 val androidTargetSdkVersion by extra(36)
-val androidCompileSdkVersion by extra(36)
+val androidCompileSdkVersion by extra(37)
 val androidCompileNdkVersion by extra("29.0.13113456")
-val androidBuildToolsVersion by extra("36.0.0")
+val androidBuildToolsVersion by extra("37.0.0")
 val androidSourceCompatibility by extra(JavaVersion.VERSION_21)
 val androidTargetCompatibility by extra(JavaVersion.VERSION_21)
 
@@ -66,8 +79,8 @@ tasks.register<Delete>("clean") {
 listOf("Debug", "Release").forEach { variant ->
     tasks.register("build$variant") {
         description = "Build LSPatch with $variant"
-        dependsOn(projects.jar.dependencyProject.tasks["build$variant"])
-        dependsOn(projects.manager.dependencyProject.tasks["build$variant"])
+        dependsOn(":jar:build$variant")
+        dependsOn(":manager:build$variant")
     }
 }
 
@@ -82,7 +95,7 @@ fun Project.configureBaseExtension() {
         buildToolsVersion = androidBuildToolsVersion
 
         externalNativeBuild.cmake {
-            version = "3.28.1+"
+            version = "3.29.8+"
             buildStagingDirectory = layout.buildDirectory.get().asFile
         }
 
@@ -104,8 +117,9 @@ fun Project.configureBaseExtension() {
 
             externalNativeBuild {
                 cmake {
-                    arguments += "-DEXTERNAL_ROOT=${File(rootDir.absolutePath, "core/external")}"
-                    arguments += "-DCORE_ROOT=${File(rootDir.absolutePath, "core/core/src/main/jni")}"
+                    // Vector master builds its hook engine as the `native` static lib under
+                    // core/native, resolving core/external via a single VECTOR_ROOT.
+                    arguments += "-DVECTOR_ROOT=${File(rootDir.absolutePath, "core")}"
                     abiFilters("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
                     val flags = arrayOf(
                         "-Wall",
@@ -120,13 +134,23 @@ fun Project.configureBaseExtension() {
                         "-Wno-builtin-macro-redefined",
                         "-Wno-unused-value",
                         "-D__FILE__=__FILE_NAME__",
+                        // parallel_hashmap's SSE2 group scan arrives twice on the x86 ABIs once
+                        // dex_builder is imported; phmap's layout depends on this flag, so it must
+                        // match core/native or the shared .so has an invisible ODR violation.
+                        "-DPHMAP_HAVE_SSE2=0",
+                        "-DPHMAP_HAVE_SSSE3=0",
+                        // core/native's config.h reads these as compiler defines, as Vector's own
+                        // build passes them; VERSION_NAME is a string literal.
+                        "-DVERSION_CODE=$verCode",
+                        "-DVERSION_NAME='\"$verName\"'",
                     )
-                    cppFlags("-std=c++20", *flags)
+                    cppFlags("-std=c++23", *flags)
                     cFlags("-std=c18", *flags)
                     arguments(
                         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                        "-DVERSION_CODE=$verCode",
-                        "-DVERSION_NAME=$verName",
+                        // 16 KB page alignment for Android 15+ compatibility.
+                        "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384",
+                        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,max-page-size=16384",
                     )
                 }
             }
@@ -165,7 +189,7 @@ fun Project.configureBaseExtension() {
                             "-fno-asynchronous-unwind-tables",
                             "-flto=thin",
                             "-Wl,--thinlto-cache-policy,cache_size_bytes=300m",
-                            "-Wl,--thinlto-cache-dir=${buildDir.absolutePath}/.lto-cache",
+                            "-Wl,--thinlto-cache-dir=${layout.buildDirectory.get().asFile.absolutePath}/.lto-cache",
                         )
                         cppFlags.addAll(flags)
                         cFlags.addAll(flags)
@@ -179,7 +203,7 @@ fun Project.configureBaseExtension() {
                                 "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=$configFlags",
                                 "-DCMAKE_C_FLAGS_RELEASE=$configFlags",
                                 "-DCMAKE_C_FLAGS_RELWITHDEBINFO=$configFlags",
-                                "-DDEBUG_SYMBOLS_PATH=${buildDir.absolutePath}/symbols",
+                                "-DDEBUG_SYMBOLS_PATH=${layout.buildDirectory.get().asFile.absolutePath}/symbols",
                             )
                         )
                     }
@@ -194,33 +218,33 @@ fun Project.configureBaseExtension() {
     }
 
     extensions.findByType(ApplicationAndroidComponentsExtension::class)?.let { androidComponents ->
-        val optimizeReleaseRes = task("optimizeReleaseRes").doLast {
-            val aapt2 = File(
-                androidComponents.sdkComponents.sdkDirectory.get().asFile,
-                "build-tools/${androidBuildToolsVersion}/aapt2"
-            )
-            val zip = java.nio.file.Paths.get(
-                project.buildDir.path,
-                "intermediates",
-                "optimized_processed_res",
-                "release",
-                "optimizeReleaseResources",
-                "resources-release-optimize.ap_"
-            )
-            val optimized = File("${zip}.opt")
-            val cmd = exec {
-                commandLine(
-                    aapt2, "optimize",
+        val optimizeReleaseRes = tasks.register("optimizeReleaseRes") {
+            doLast {
+                val aapt2 = File(
+                    androidComponents.sdkComponents.sdkDirectory.get().asFile,
+                    "build-tools/${androidBuildToolsVersion}/aapt2"
+                )
+                val zip = java.nio.file.Paths.get(
+                    project.layout.buildDirectory.get().asFile.path,
+                    "intermediates",
+                    "optimized_processed_res",
+                    "release",
+                    "optimizeReleaseResources",
+                    "resources-release-optimize.ap_"
+                )
+                val optimized = File("${zip}.opt")
+                val process = ProcessBuilder(
+                    aapt2.absolutePath, "optimize",
                     "--collapse-resource-names",
                     "--enable-sparse-encoding",
-                    "-o", optimized,
-                    zip
-                )
-                isIgnoreExitValue = false
-            }
-            if (cmd.exitValue == 0) {
-                delete(zip)
-                optimized.renameTo(zip.toFile())
+                    "-o", optimized.absolutePath,
+                    zip.toString()
+                ).redirectErrorStream(true).start()
+                process.inputStream.bufferedReader().readText().takeIf { it.isNotBlank() }?.let(::println)
+                if (process.waitFor() == 0) {
+                    java.nio.file.Files.deleteIfExists(zip)
+                    optimized.renameTo(zip.toFile())
+                }
             }
         }
 
@@ -233,24 +257,34 @@ fun Project.configureBaseExtension() {
 }
 
 subprojects {
+    // :apkzlib is vendored Google code (com.android.tools.build.apkzlib) -- keep its upstream
+    // style, don't subject it to our formatter.
+    if (name != "apkzlib") {
+        apply(plugin = "com.diffplug.spotless")
+        extensions.configure<com.diffplug.gradle.spotless.SpotlessExtension> {
+            // Adopt formatting without a mass reflow: ratchet formats only files that differ from
+            // the baseline, so the never-formatted tree converges as it is touched rather than in
+            // one sweeping commit. A clean checkout has nothing to format; only changed files are
+            // enforced.
+            ratchetFrom("origin/master")
+            kotlin {
+                target("src/**/*.kt")
+                // The core (Vector) formats Kotlin with ktfmt in kotlinlang (4-space) style; match
+                // it, but widen to 120 cols so the repo's existing long lines are not rewrapped --
+                // that keeps each ratcheted file's diff to the real change, not a width reflow.
+                ktfmt(lspatch.versions.ktfmt.get()).kotlinlangStyle().configure { it.setMaxWidth(120) }
+            }
+            java {
+                target("src/**/*.java")
+                // 4-space, 120-col -- closest to the hand-written Java already in the tree.
+                palantirJavaFormat()
+            }
+        }
+    }
     plugins.withId("com.android.application") {
         configureBaseExtension()
     }
     plugins.withId("com.android.library") {
         configureBaseExtension()
-    }
-}
-
-
-project(":core") {
-    afterEvaluate {
-        if (property("android") is LibraryExtension) {
-            val android = property("android") as LibraryExtension
-            android.run {
-                buildTypes {
-                    release { proguardFiles(rootProject.file("share/lspatch-rules.pro")) }
-                }
-            }
-        }
     }
 }

@@ -1,71 +1,88 @@
 package org.lsposed.lspatch
 
-import androidx.core.net.toUri
-import androidx.documentfile.provider.DocumentFile
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.lsposed.lspatch.config.Configs
 import org.lsposed.lspatch.config.MyKeyStore
-import org.lsposed.lspatch.share.Constants
-import org.lsposed.lspatch.share.PatchConfig
-import org.lsposed.patch.LSPatch
+import org.lsposed.lspatch.data.model.PatchRequest
+import org.lsposed.lspatch.data.repository.PatchOutputStore
+import org.lsposed.patch.ApkPatcher
+import org.lsposed.patch.KeystoreSpec
+import org.lsposed.patch.ManifestOverrides
+import org.lsposed.patch.PatchSpec
 import org.lsposed.patch.util.Logger
-import java.io.IOException
-import java.util.Collections.addAll
 
 object Patcher {
 
-    class Options(
-        private val injectDex: Boolean,
-        private val config: PatchConfig,
-        private val apkPaths: List<String>,
-        private val embeddedModules: List<String>?
-    ) {
-        fun toStringArray(): Array<String> {
-            return buildList {
-                addAll(apkPaths)
-                add("-o"); add(lspApp.tmpApkDir.absolutePath)
-                if (config.debuggable) add("-d")
-                add("-l"); add(config.sigBypassLevel.toString())
-                if (config.useManager) add("--manager")
-                if (config.overrideVersionCode) add("-r")
-                if (Configs.detailPatchLogs) add("-v")
-                embeddedModules?.forEach {
-                    add("-m"); add(it)
-                }
-                if(injectDex) add("--injectdex")
-                if (!MyKeyStore.useDefault) {
-                    addAll(arrayOf("-k", MyKeyStore.file.path, Configs.keyStorePassword, Configs.keyStoreAlias, Configs.keyStoreAliasPassword))
-                }
-            }.toTypedArray()
-        }
-    }
+    /**
+     * Translates a [PatchRequest] into the patcher's own spec.
+     *
+     * Built directly rather than rendered into command-line flags for the patcher to parse back: every value here is
+     * already typed, and the round trip through argv was only ever an artefact of the engine and the CLI having been
+     * the same class.
+     */
+    private fun PatchRequest.toSpec(outputDir: File): PatchSpec =
+        PatchSpec.builder()
+            .apks(target.apkPaths.map(::File))
+            .outputDir(outputDir)
+            .useManager(mode.useManager)
+            .debuggable(debuggable)
+            .sigBypassLevel(sigBypassLevel)
+            .injectDex(injectDex)
+            // The output directory is cleared before every run, so anything still there is a
+            // leftover rather than something worth protecting.
+            .forceOverwrite(true)
+            .verbose(Configs.detailPatchLogs)
+            .modules(effectiveModules.map { File(it.apkPath) })
+            // Record the manager's own current package so a manager-mode app keeps reaching it after
+            // the manager is reinstalled under a cloaked package name; integrated apps bind nothing.
+            .managerPackageName(if (mode.useManager) lspApp.packageName else null)
+            .manifestOverrides(
+                ManifestOverrides.builder()
+                    .versionCode(versionCodeOverride)
+                    .label(labelOverride)
+                    .targetSdkVersion(targetSdkOverride)
+                    .extractNativeLibs(if (extractNativeLibs) true else null)
+                    .usesCleartextTraffic(if (usesCleartextTraffic) true else null)
+                    .permissions(addedPermissions)
+                    .injectDocumentsProvider(injectDocumentsProvider)
+                    .build()
+            )
+            .keystore(
+                if (MyKeyStore.useDefault) KeystoreSpec.builtIn()
+                else
+                    KeystoreSpec.of(
+                        MyKeyStore.file,
+                        Configs.keyStorePassword,
+                        Configs.keyStoreAlias,
+                        Configs.keyStoreAliasPassword,
+                    )
+            )
+            .build()
 
-    suspend fun patch(logger: Logger, options: Options) {
+    /**
+     * Runs [request] and returns the apks it produced.
+     *
+     * The result stays where it was written -- app-private, one directory per package. It used to be copied on to a
+     * folder the user had picked through the storage access framework, which meant every patch depended on a persisted
+     * grant; the entry point that never asked for one therefore failed at this exact point, every time.
+     */
+    suspend fun patch(logger: Logger, request: PatchRequest): List<File> =
         withContext(Dispatchers.IO) {
-            LSPatch(logger, *options.toStringArray()).doCommandLine()
-
-            val uri = Configs.storageDirectory?.toUri()
-                ?: throw IOException("Uri is null")
-            val root = DocumentFile.fromTreeUri(lspApp, uri)
-                ?: throw IOException("DocumentFile is null")
-            root.listFiles().forEach {
-                if (it.name?.endsWith(Constants.PATCH_FILE_SUFFIX) == true) it.delete()
+            // Checked here rather than left to the engine: by this point the paths are the ones the
+            // system reports for the target now, so their absence is a fact about the app and can be
+            // said as one, instead of surfacing as the engine's own exception type and message.
+            val missing = request.target.apkPaths.filterNot { File(it).exists() }
+            if (missing.isNotEmpty()) {
+                throw java.io.IOException(
+                    "${request.label} has no apk at ${missing.first()}" +
+                        if (missing.size > 1) " (and ${missing.size - 1} more)" else ""
+                )
             }
-            lspApp.tmpApkDir.walk()
-                .filter { it.name.endsWith(Constants.PATCH_FILE_SUFFIX) }
-                .forEach { apk ->
-                    val file = root.createFile("application/vnd.android.package-archive", apk.name)
-                        ?: throw IOException("Failed to create output file")
-                    val output = lspApp.contentResolver.openOutputStream(file.uri)
-                        ?: throw IOException("Failed to open output stream")
-                    output.use {
-                        apk.inputStream().use { input ->
-                            input.copyTo(output)
-                        }
-                    }
-                }
-            logger.i("Patched files are saved to ${root.uri.lastPathSegment}")
+            val outputDir = PatchOutputStore.prepare(request.packageName)
+            val produced = ApkPatcher(logger, request.toSpec(outputDir)).patch()
+            if (produced.isEmpty()) throw java.io.IOException("The patcher produced no apk")
+            produced
         }
-    }
 }

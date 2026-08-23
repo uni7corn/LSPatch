@@ -10,11 +10,24 @@ public class Constants {
 
     final static public String PATCH_FILE_SUFFIX = "-lspatched.apk";
     final static public String PROXY_APP_COMPONENT_FACTORY = "org.lsposed.lspatch.metaloader.LSPAppComponentFactoryStub";
+    /**
+     * The {@code DocumentsProvider} baked into the loader, and the suffix its authority is built
+     * from: {@code <packageName>.lspatch.documents}. Per-package so two patched apps never collide,
+     * and shared here so the patcher writes the same authority the provider is registered under.
+     */
+    final static public String DOCUMENTS_PROVIDER_CLASS = "org.lsposed.lspatch.loader.LSPatchDocumentsProvider";
+    final static public String DOCUMENTS_PROVIDER_AUTHORITY_SUFFIX = ".lspatch.documents";
     final static public String MANAGER_PACKAGE_NAME = "org.lsposed.lspatch";
+    final static public String MANAGER_SERVICE_NAME = "org.lsposed.lspatch.manager.ModuleService";
+    final static public String MIGRATE_ASSET_PATH = "assets/lspatch/migrate.zip";
     final static public int MIN_ROLLING_VERSION_CODE = 348;
 
     final static public int SIGBYPASS_LV_DISABLE = 0;
     final static public int SIGBYPASS_LV_PM = 1;
     final static public int SIGBYPASS_LV_PM_OPENAT = 2;
-    final static public int SIGBYPASS_LV_MAX = 3;
+    // Level 3 adds raw-syscall coverage: a packer that reads its own apk with an inline `svc`
+    // (to slip past the libc __openat redirect of level 2) has those svc sites instrumented so the
+    // read is still pointed at the stored original. See patch-loader bypass_sig.cpp.
+    final static public int SIGBYPASS_LV_PM_OPENAT_SVC = 3;
+    final static public int SIGBYPASS_LV_MAX = 4;
 }
